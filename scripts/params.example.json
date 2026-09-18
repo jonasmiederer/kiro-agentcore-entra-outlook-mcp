@@ -1,0 +1,6 @@
+{
+  "EntraTenantId": "REPLACE_WITH_ENTRA_TENANT_ID",
+  "ApiAppClientId": "REPLACE_WITH_API_APP_GUID",
+  "KiroClientAppId": "REPLACE_WITH_KIRO_CLIENT_APP_GUID",
+  "ApiAppClientSecret": "REPLACE_WITH_API_APP_CLIENT_SECRET"
+}

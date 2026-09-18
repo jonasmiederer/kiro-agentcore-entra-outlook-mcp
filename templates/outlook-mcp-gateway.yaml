@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Outlook via MCP for Kiro users - Option A (no Lambda). AgentCore Gateway with a
+  CUSTOM_JWT inbound authorizer (Entra), a MicrosoftOauth2 credential provider in
+  on-behalf-of (TOKEN_EXCHANGE) mode, and Microsoft Graph attached as an OpenAPI
+  target. The Gateway performs the OBO exchange itself and calls Graph /me/* as the
+  signed-in Kiro user. See docs/outlook-mcp-agentcore-gateway-entra-delegated-access.md
+  section 7. All resources are AWS::BedrockAgentCore::* CloudFormation types.
+
+# ---------------------------------------------------------------------------
+# Deploy order (why this stack is self-contained):
+#   1) Secrets Manager secret holds the Entra API app client secret (never in the
+#      template body; passed as a NoEcho param at deploy time OR pre-seeded).
+#   2) OAuth2CredentialProvider (MicrosoftOauth2, ClientSecretSource=EXTERNAL) reads
+#      that secret from Secrets Manager -> its ARN feeds the target.
+#   3) Gateway carries the inbound CUSTOM_JWT authorizer (Entra discovery URL,
+#      allowedAudience = API app GUID, custom claim azp = Kiro client GUID).
+#   4) GatewayTarget attaches Graph as an OpenAPI target with OAUTH/TOKEN_EXCHANGE
+#      referencing the provider ARN.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  EntraTenantId:
+    Type: String
+    Description: Microsoft Entra tenant ID (GUID).
+    AllowedPattern: "^[0-9a-fA-F-]{36}$"
+
+  ApiAppClientId:
+    Type: String
+    Description: >
+      Entra "Outlook MCP Gateway" API app registration client ID (GUID). This is
+      BOTH the Gateway allowedAudience AND the OBO middle-tier client.
+    AllowedPattern: "^[0-9a-fA-F-]{36}$"
+
+  KiroClientAppId:
+    Type: String
+    Description: >
+      Entra "Kiro Outlook MCP client" public client app ID (GUID). Matched against
+      the inbound token's azp claim so only tokens minted for Kiro are accepted.
+    AllowedPattern: "^[0-9a-fA-F-]{36}$"
+
+  ApiAppClientSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      The Entra API app client secret. Leave blank if you pre-created the Secrets
+      Manager secret out of band and set ExistingSecretArn instead. When provided,
+      this stack creates the secret for you.
+
+  ExistingSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of an existing Secrets Manager secret holding the client secret under JSON
+      key "client_secret". Leave blank to have the stack create the secret from
+      ApiAppClientSecret.
+
+  GraphScopes:
+    Type: CommaDelimitedList
+    Default: "https://graph.microsoft.com/Mail.Read,https://graph.microsoft.com/Calendars.Read,https://graph.microsoft.com/User.Read"
+    Description: >
+      Delegated Graph scopes the Gateway requests during OBO. Start read-only; add
+      Mail.Send / *.ReadWrite only when a write tool is in scope. Must be consented
+      on the API app.
+
+  GatewayName:
+    Type: String
+    Default: "outlook-mcp"
+    Description: Gateway name (max 48 chars per the AgentCore schema).
+    AllowedPattern: "^([0-9a-zA-Z][-]?){1,48}$"
+
+  OpenApiBucketName:
+    Type: String
+    Description: >
+      Name of an EXISTING S3 bucket already holding graph-me-openapi.json. The
+      deploy script creates this bucket and uploads the spec before this stack runs,
+      so the OpenAPI target can sync on create.
+  OpenApiKey:
+    Type: String
+    Default: "graph-me-openapi.json"
+    Description: S3 key of the Graph OpenAPI spec inside OpenApiBucketName.
+
+Conditions:
+  CreateSecret: !Equals [!Ref ExistingSecretArn, ""]
+
+Resources:
+
+  # 1) Client secret in Secrets Manager (only if ExistingSecretArn not supplied).
+  ApiAppSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateSecret
+    Properties:
+      Name: !Sub "${GatewayName}-entra-api-app-secret"
+      Description: Entra API app (Outlook MCP Gateway) client secret for AgentCore OBO.
+      SecretString: !Sub '{"client_secret":"${ApiAppClientSecret}"}'
+
+  # 2) Microsoft OAuth2 credential provider in OBO mode.
+  #    The secret is read from Secrets Manager (EXTERNAL) so it never lives in the
+  #    provider config or the template. The Gateway target references this ARN.
+  OutlookOauthProvider:
+    Type: AWS::BedrockAgentCore::OAuth2CredentialProvider
+    Properties:
+      Name: !Sub "${GatewayName}-microsoft-obo"
+      CredentialProviderVendor: MicrosoftOauth2
+      Oauth2ProviderConfigInput:
+        MicrosoftOauth2ProviderConfig:
+          ClientId: !Ref ApiAppClientId
+          TenantId: !Ref EntraTenantId
+          ClientSecretSource: EXTERNAL
+          ClientSecretConfig:
+            SecretId: !If [CreateSecret, !Ref ApiAppSecret, !Ref ExistingSecretArn]
+            JsonKey: client_secret
+
+  # 3) IAM role the Gateway assumes to reach its targets / read config.
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GatewayName}-gateway-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: gateway-obo-and-identity
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read the credential provider + perform the OBO token exchange.
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetResourceOauth2Token
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                Resource: "*"
+              # Read the client secret backing the provider.
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !If [CreateSecret, !Ref ApiAppSecret, !Ref ExistingSecretArn]
+              # Read the OpenAPI spec the target loads from S3.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${OpenApiBucketName}/${OpenApiKey}"
+
+  # 4) The Gateway with the Entra inbound authorizer.
+  OutlookGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Ref GatewayName
+      Description: Outlook (Microsoft Graph) delegated access for Kiro users via MCP.
+      ProtocolType: MCP
+      RoleArn: !GetAtt GatewayRole.Arn
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub "https://login.microsoftonline.com/${EntraTenantId}/v2.0/.well-known/openid-configuration"
+          AllowedAudience:
+            - !Ref ApiAppClientId
+          # Entra puts delegated scopes in `scp` as the SHORT name (access_as_user),
+          # but MCP clients (Kiro) read the ADVERTISED scope from protected-resource
+          # metadata and request that verbatim. Advertise the full api:// URI so the
+          # client's /authorize carries a scope (fixes AADSTS900144 "missing scope"),
+          # while validating against the short name Entra actually emits - this is the
+          # AdvertisedScopeMapping escape from the full-URI-vs-scp deadlock.
+          AllowedScopes:
+            - access_as_user
+          AdvertisedScopeMapping:
+            access_as_user: !Sub "api://${ApiAppClientId}/access_as_user"
+          # Entra v2 access tokens carry the calling app in `azp`, not client_id,
+          # so AllowedClients does not apply - enforce azp via a custom claim.
+          CustomClaims:
+            - InboundTokenClaimName: azp
+              InboundTokenClaimValueType: STRING
+              AuthorizingClaimMatchValue:
+                ClaimMatchValue:
+                  MatchValueString: !Ref KiroClientAppId
+                ClaimMatchOperator: EQUALS
+
+  # 5) Microsoft Graph as an OpenAPI target, OBO (TOKEN_EXCHANGE) outbound auth.
+  GraphTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      Name: OutlookGraph
+      Description: Microsoft Graph /me mail + calendar, delegated per signed-in user.
+      GatewayIdentifier: !GetAtt OutlookGateway.GatewayIdentifier
+      TargetConfiguration:
+        Mcp:
+          OpenApiSchema:
+            S3:
+              Uri: !Sub "s3://${OpenApiBucketName}/${OpenApiKey}"
+      CredentialProviderConfigurations:
+        - CredentialProviderType: OAUTH
+          CredentialProvider:
+            OauthCredentialProvider:
+              ProviderArn: !GetAtt OutlookOauthProvider.CredentialProviderArn
+              GrantType: TOKEN_EXCHANGE
+              Scopes: !Ref GraphScopes
+              CustomParameters:
+                subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
+
+Outputs:
+  GatewayId:
+    Description: AgentCore Gateway ID.
+    Value: !GetAtt OutlookGateway.GatewayIdentifier
+  GatewayArn:
+    Description: AgentCore Gateway ARN.
+    Value: !GetAtt OutlookGateway.GatewayArn
+  GatewayUrl:
+    Description: MCP endpoint to put in Kiro's mcp.json.
+    Value: !GetAtt OutlookGateway.GatewayUrl
+  OpenApiBucket:
+    Description: Bucket holding the Graph OpenAPI spec.
+    Value: !Ref OpenApiBucketName
+  CredentialProviderArn:
+    Description: MicrosoftOauth2 OBO credential provider ARN.
+    Value: !GetAtt OutlookOauthProvider.CredentialProviderArn
