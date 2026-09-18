@@ -1,12 +1,20 @@
-# Outlook via MCP for Kiro users — Option A (no Lambda)
+# Outlook MCP Gateway for Kiro
 
-Delegated Outlook/Graph access for Kiro users through **AgentCore Gateway + Entra**,
-with **Microsoft Graph attached as an OpenAPI target** and the Gateway performing the
-on-behalf-of (OBO) token exchange itself — no Lambda, no interceptor.
+Give Kiro delegated access to a user's Outlook mail and calendar through an
+**AgentCore Gateway** fronted by **Microsoft Entra**. Microsoft Graph is attached
+directly as an **OpenAPI target**, and the Gateway performs the on-behalf-of (OBO)
+token exchange itself — no Lambda and no custom interceptor to build or maintain.
 
-Implements section 7 ("Simpler alternative: no Lambda") of the design doc, which is
-copied to `docs/design-reference.md`. Everything is CloudFormation
-(`AWS::BedrockAgentCore::*`).
+Everything is defined in CloudFormation (`AWS::BedrockAgentCore::*`). The full
+research and design writeup lives in `docs/design-reference.md`.
+
+## How it works
+
+Kiro authenticates the user against Entra and sends the resulting token to the
+AgentCore Gateway. The Gateway validates that token (`CUSTOM_JWT` inbound
+authorizer), exchanges it for a Microsoft Graph token via OBO, and calls Graph on
+the user's behalf using the attached OpenAPI target. The user only ever sees their
+own mailbox and calendar, scoped to the Graph permissions you grant.
 
 ## What deploys
 
@@ -18,10 +26,10 @@ copied to `docs/design-reference.md`. Everything is CloudFormation
 | `AWS::BedrockAgentCore::Gateway` | `CUSTOM_JWT` inbound authorizer: Entra discovery URL, `allowedAudience` = API app, custom claim `azp` = Kiro client |
 | `AWS::BedrockAgentCore::GatewayTarget` | Graph OpenAPI target, OAuth `TOKEN_EXCHANGE` (OBO) referencing the provider ARN |
 
-Verified against the live CloudFormation resource schemas for
-`AWS::BedrockAgentCore::*`: `OAuthGrantType` includes `TOKEN_EXCHANGE`, so OBO is
-fully CFN-native. Availability may vary by region — deploy to a region where
-AgentCore Gateway is supported.
+OBO is fully CloudFormation-native here: the `AWS::BedrockAgentCore::*` schemas
+expose `TOKEN_EXCHANGE` as an `OAuthGrantType`, so no custom code is needed.
+Availability varies by region — deploy to a region where AgentCore Gateway is
+supported.
 
 ## Files
 
